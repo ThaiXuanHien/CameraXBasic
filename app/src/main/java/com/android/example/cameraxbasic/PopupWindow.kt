@@ -38,8 +38,7 @@ class PopupWindow(
     }
 
     fun show() {
-        showAsDropDown(view, -4,
-            -view.height - -4)
+        showAsDropDown(view)
     }
 
     class ListAdapter(
