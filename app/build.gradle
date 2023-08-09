@@ -66,6 +66,7 @@ dependencies {
     // Concurrent library for asynchronous coroutines
     implementation 'androidx.concurrent:concurrent-futures-ktx:1.1.0'
 
+
     // Navigation library
     def nav_version = "2.3.5"
     implementation "androidx.navigation:navigation-fragment-ktx:$nav_version"
@@ -85,6 +86,7 @@ dependencies {
     implementation "androidx.camera:camera-view:$camerax_version"
     implementation "androidx.camera:camera-video:${camerax_version}"
 
+    implementation("androidx.dynamicanimation:dynamicanimation:1.0.0")
 
     // CameraX Extensions library
     // implementation "androidx.camera:camera-extensions:$camerax_version"

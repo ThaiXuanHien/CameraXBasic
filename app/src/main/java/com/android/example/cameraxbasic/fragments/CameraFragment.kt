@@ -20,44 +20,57 @@ import android.annotation.SuppressLint
 import android.content.*
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.ImageFormat
 import android.graphics.drawable.ColorDrawable
+import android.hardware.camera2.CameraAccessException
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Rational
+import android.util.Size
+import android.util.TypedValue
+import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.LayoutInflater
+import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.video.Quality
-import androidx.camera.video.QualitySelector
 import androidx.concurrent.futures.await
+import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
+import androidx.core.view.GestureDetectorCompat
+import androidx.core.view.isVisible
 import androidx.core.view.setPadding
+import androidx.core.view.updateLayoutParams
+import androidx.dynamicanimation.animation.DynamicAnimation
+import androidx.dynamicanimation.animation.SpringAnimation
+import androidx.dynamicanimation.animation.SpringForce
 import androidx.fragment.app.Fragment
+import androidx.lifecycle.findViewTreeLifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.whenCreated
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.navigation.Navigation
 import androidx.window.layout.WindowInfoTracker
-import androidx.window.layout.WindowMetricsCalculator
-import com.android.example.cameraxbasic.CameraCapability
 import com.android.example.cameraxbasic.KEY_EVENT_ACTION
 import com.android.example.cameraxbasic.KEY_EVENT_EXTRA
 import com.android.example.cameraxbasic.PopupWindow
 import com.android.example.cameraxbasic.R
 import com.android.example.cameraxbasic.databinding.CameraUiContainerBinding
 import com.android.example.cameraxbasic.databinding.FragmentCameraBinding
-import com.android.example.cameraxbasic.getAspectRatio
-import com.android.example.cameraxbasic.getNameString
 import com.android.example.cameraxbasic.utils.ANIMATION_FAST_MILLIS
 import com.android.example.cameraxbasic.utils.ANIMATION_SLOW_MILLIS
+import com.android.example.cameraxbasic.utils.FocusPointDrawable
 import com.android.example.cameraxbasic.utils.MediaStoreUtils
+import com.android.example.cameraxbasic.utils.afterMeasured
 import com.android.example.cameraxbasic.utils.simulateClick
 import com.bumptech.glide.Glide
 import com.bumptech.glide.request.RequestOptions
@@ -70,6 +83,7 @@ import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+
 
 /** Helper type alias used for analysis use case callbacks */
 typealias LumaListener = (luma: Double) -> Unit
@@ -102,11 +116,12 @@ class CameraFragment : Fragment() {
     private lateinit var windowInfoTracker: WindowInfoTracker
     private var cameraInfo: CameraInfo? = null
     private var cameraControl: CameraControl? = null
-    private val cameraCapabilities = mutableListOf<CameraCapability>()
+    //private val cameraCapabilities = mutableListOf<CameraCapability>()
     private var resolutionList = listOf<String>()
-    private var cameraIndex = 0
+    private var aspectRatioList = listOf<String>()
+    private var cameraIndex = CameraSelector.LENS_FACING_BACK
     private var qualityIndex = DEFAULT_QUALITY_IDX
-
+    private var aspectRatioIndex = 0
     private val displayManager by lazy {
         requireContext().getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
     }
@@ -232,9 +247,16 @@ class CameraFragment : Fragment() {
 
 
     private fun initializeQualitySectionsUI() {
-        resolutionList = cameraCapabilities[cameraIndex].qualities.map {
-            it.getNameString()
+
+        resolutionList = getOutputSizes(getCameraId().toString(), ImageFormat.JPEG).map {
+            it.width.toString() + "x" + it.height.toString()
         }
+        aspectRatioList = getSupportedAspectRatios(getCameraId().toString(), ImageFormat.JPEG).map {
+            it.toString()
+        }
+
+        cameraUiContainerBinding?.txtAspectRatio?.text = aspectRatioList[aspectRatioIndex]
+        cameraUiContainerBinding?.txtResolution?.text = resolutionList[qualityIndex]
     }
 
     /**
@@ -277,15 +299,14 @@ class CameraFragment : Fragment() {
     private fun bindCameraUseCases() {
 
         // Get screen metrics used to setup camera for full screen resolution
-        val metrics = WindowMetricsCalculator.getOrCreate()
-            .computeCurrentWindowMetrics(requireActivity()).bounds
-        Log.d(TAG, "Screen metrics: ${metrics.width()} x ${metrics.height()}")
-
-        val screenAspectRatio = aspectRatio(metrics.width(), metrics.height())
-        Log.d(TAG, "Preview aspect ratio: $screenAspectRatio")
+//        val metrics = WindowMetricsCalculator.getOrCreate()
+//            .computeCurrentWindowMetrics(requireActivity()).bounds
+//        Log.d(TAG, "Screen metrics: ${metrics.width()} x ${metrics.height()}")
+//
+//        val screenAspectRatio = aspectRatio(metrics.width(), metrics.height())
+//        Log.d(TAG, "Preview aspect ratio: $screenAspectRatio")
 
         val rotation = fragmentCameraBinding.viewFinder.display.rotation
-        val quality = cameraCapabilities[cameraIndex].qualities[qualityIndex]
         // CameraProvider
         val cameraProvider = cameraProvider
             ?: throw IllegalStateException("Camera initialization failed.")
@@ -293,16 +314,40 @@ class CameraFragment : Fragment() {
         // CameraSelector
         val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
 
+
+        val selectedResolutionStr: String = resolutionList[qualityIndex]
+        val dimensions = selectedResolutionStr.split("x".toRegex()).dropLastWhile { it.isEmpty() }
+            .toTypedArray()
+        val width = dimensions[0].toInt()
+        val height = dimensions[1].toInt()
+        val size = Size(width, height)
+
+        val selectedAspectRatioStr: String = aspectRatioList[aspectRatioIndex]
+        Log.d("Hien", "bindCameraUseCases: $aspectRatioList")
+        val dimensionsRatio = selectedAspectRatioStr.split("/".toRegex()).dropLastWhile { it.isEmpty() }
+            .toTypedArray()
+        val ratioWidth = dimensionsRatio[0].toInt()
+        val ratioHeight = dimensionsRatio[1].toInt()
+        val dimensionRationStr = "H,${ratioHeight}:${ratioWidth}"
+
+        fragmentCameraBinding.viewFinder.updateLayoutParams<ConstraintLayout.LayoutParams> {
+            dimensionRatio = dimensionRationStr
+        }
+
         // Preview
         preview = Preview.Builder()
             // We request aspect ratio but no resolution
-            .setTargetAspectRatio(quality.getAspectRatio(quality))
+            .setTargetResolution(size)
+//            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
             // Set initial target rotation
             .setTargetRotation(rotation)
-            .build()
-
+            .build().apply {
+                setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
+            }
         // ImageCapture
         imageCapture = ImageCapture.Builder()
+            .setTargetResolution(size)
+//            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             // We request aspect ratio but no resolution to match preview config, but letting
             // CameraX optimize for whatever specific resolution best fits our use cases
@@ -314,7 +359,8 @@ class CameraFragment : Fragment() {
         // ImageAnalysis
         imageAnalyzer = ImageAnalysis.Builder()
             // We request aspect ratio but no resolution
-            .setTargetAspectRatio(screenAspectRatio)
+            .setTargetResolution(size)
+//            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
             // Set initial target rotation, we will have to call this again if rotation changes
             // during the lifecycle of this use case
             .setTargetRotation(rotation)
@@ -357,6 +403,52 @@ class CameraFragment : Fragment() {
 
     private fun removeCameraStateObservers(cameraInfo: CameraInfo) {
         cameraInfo.cameraState.removeObservers(viewLifecycleOwner)
+    }
+
+    fun getOutputSizes(cameraId: String, format: Int): List<Size> {
+        val cameraManager = context?.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+
+        val streamConfigMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        return streamConfigMap?.getOutputSizes(format)?.toList() ?: emptyList()
+    }
+
+    private fun getSupportedAspectRatios(cameraId: String, format: Int): List<Rational> {
+        val cameraManager = context?.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+
+        val streamConfigMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val outputSizes = streamConfigMap?.getOutputSizes(format)
+
+        val aspectRatios = mutableListOf<Rational>()
+
+        outputSizes?.forEach { size ->
+            val aspectRatio = Rational(size.width, size.height)
+            if (!aspectRatios.contains(aspectRatio)) {
+                aspectRatios.add(aspectRatio)
+            }
+        }
+
+        return aspectRatios
+    }
+
+    private fun getCameraId(): String? {
+        val cameraManager = context?.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+
+        try {
+            for (cameraId in cameraManager.cameraIdList) {
+                val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
+                val facing = cameraCharacteristics.get(CameraCharacteristics.LENS_FACING)
+
+                if (facing == cameraIndex) {
+                    return cameraId
+                }
+            }
+        } catch (e: CameraAccessException) {
+            e.printStackTrace()
+        }
+
+        return null
     }
 
     private fun observeCameraState(cameraInfo: CameraInfo) {
@@ -502,7 +594,6 @@ class CameraFragment : Fragment() {
 
     /** Method used to re-draw the camera UI controls, called every time configuration changes. */
     private fun updateCameraUi() {
-
         // Remove previous UI if any
         cameraUiContainerBinding?.root?.let {
             fragmentCameraBinding.root.removeView(it)
@@ -524,7 +615,6 @@ class CameraFragment : Fragment() {
 
         // Listener for button used to capture photo
         cameraUiContainerBinding?.cameraCaptureButton?.setOnClickListener {
-
             // Get a stable reference of the modifiable image capture use case
             imageCapture?.let { imageCapture ->
 
@@ -601,11 +691,14 @@ class CameraFragment : Fragment() {
             // Listener for button used to switch cameras. Only called if the button is enabled
             it.setOnClickListener {
                 lensFacing = if (CameraSelector.LENS_FACING_FRONT == lensFacing) {
+                    cameraIndex = CameraSelector.LENS_FACING_BACK
                     CameraSelector.LENS_FACING_BACK
                 } else {
+                    cameraIndex = CameraSelector.LENS_FACING_FRONT
                     CameraSelector.LENS_FACING_FRONT
                 }
                 // Re-bind use cases to update selected camera
+                initializeQualitySectionsUI()
                 bindCameraUseCases()
             }
         }
@@ -639,12 +732,90 @@ class CameraFragment : Fragment() {
             }, resolutionList).show()
         }
 
+        cameraUiContainerBinding?.txtAspectRatio?.setOnClickListener { it ->
+            PopupWindow(it, { position ->
+                aspectRatioIndex = position
+                cameraUiContainerBinding?.txtAspectRatio?.text = aspectRatioList[position]
+                viewLifecycleOwner.lifecycleScope.launch {
+                    bindCameraUseCases()
+                }
+            }, aspectRatioList).show()
+        }
+
         val scaleGestureDetector = ScaleGestureDetector(requireActivity(), zoomListener)
+
+        val gestureDetector = GestureDetectorCompat(requireContext(), object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                val meteringPointFactory = fragmentCameraBinding.viewFinder.meteringPointFactory
+                val focusPoint = meteringPointFactory.createPoint(e.x, e.y)
+                try {
+                    val meteringAction = FocusMeteringAction.Builder(focusPoint).build()
+                    camera?.cameraControl?.startFocusAndMetering(meteringAction)
+                    showFocusPoint(fragmentCameraBinding.focusPoint, e.x, e.y)
+                } catch (e: CameraInfoUnavailableException) {
+                    Log.d("ERROR", "cannot access camera", e)
+                }
+                return true
+            }
+        })
+
+
         fragmentCameraBinding.viewFinder.setOnTouchListener { v, event ->
             v.performClick()
             scaleGestureDetector.onTouchEvent(event)
+            var didConsume = scaleGestureDetector.onTouchEvent(event)
+            if (!scaleGestureDetector.isInProgress) {
+                didConsume = gestureDetector.onTouchEvent(event)
+            }
+            didConsume
             return@setOnTouchListener true
         }
+    }
+
+    private fun showFocusPoint(view: View?, x: Float, y: Float) {
+        val drawable = FocusPointDrawable()
+        val strokeWidth = TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            3f,
+            context?.resources?.displayMetrics
+        )
+        drawable.setStrokeWidth(strokeWidth)
+
+        val alphaAnimation = SpringAnimation(view, DynamicAnimation.ALPHA, 1f).apply {
+            spring.stiffness = SPRING_STIFFNESS
+            spring.dampingRatio = SPRING_DAMPING_RATIO
+
+            addEndListener { _, _, _, _ ->
+                SpringAnimation(view, DynamicAnimation.ALPHA, 0f)
+                    .apply {
+                        spring.stiffness = SPRING_STIFFNESS_ALPHA_OUT
+                        spring.dampingRatio = SpringForce.DAMPING_RATIO_NO_BOUNCY
+                    }
+                    .start()
+            }
+        }
+        val scaleAnimationX = SpringAnimation(view, DynamicAnimation.SCALE_X, 1f).apply {
+            spring.stiffness = SPRING_STIFFNESS
+            spring.dampingRatio = SPRING_DAMPING_RATIO
+        }
+        val scaleAnimationY = SpringAnimation(view, DynamicAnimation.SCALE_Y, 1f).apply {
+            spring.stiffness = SPRING_STIFFNESS
+            spring.dampingRatio = SPRING_DAMPING_RATIO
+        }
+
+        view?.apply {
+            background = drawable
+            isVisible = true
+            translationX = x - width / 2f
+            translationY = y - height / 2f
+            alpha = 0f
+            scaleX = 1.5f
+            scaleY = 1.5f
+        }
+
+        alphaAnimation.start()
+        scaleAnimationX.start()
+        scaleAnimationY.start()
     }
 
     private fun setTorchStateObserver() {
@@ -693,13 +864,13 @@ class CameraFragment : Fragment() {
         }
     }
 
-    private fun getCameraSelector(idx: Int): CameraSelector {
-        if (cameraCapabilities.size == 0) {
-            Log.i(TAG, "Error: This device does not have any camera, bailing out")
-            requireActivity().finish()
-        }
-        return (cameraCapabilities[idx % cameraCapabilities.size].camSelector)
-    }
+//    private fun getCameraSelector(idx: Int): CameraSelector {
+//        if (cameraCapabilities.size == 0) {
+//            Log.i(TAG, "Error: This device does not have any camera, bailing out")
+//            requireActivity().finish()
+//        }
+//        return (cameraCapabilities[idx % cameraCapabilities.size].camSelector)
+//    }
 
     /** Returns true if the device has an available back camera. False otherwise */
     private fun hasBackCamera(): Boolean {
@@ -800,6 +971,9 @@ class CameraFragment : Fragment() {
         private const val RATIO_4_3_VALUE = 4.0 / 3.0
         private const val RATIO_16_9_VALUE = 16.0 / 9.0
         private const val DEFAULT_QUALITY_IDX = 0
+        private const val SPRING_STIFFNESS_ALPHA_OUT = 100f
+        private const val SPRING_STIFFNESS = 800f
+        private const val SPRING_DAMPING_RATIO = 0.35f
     }
 
     init {
@@ -815,20 +989,27 @@ class CameraFragment : Fragment() {
                     try {
                         // just get the camera.cameraInfo to query capabilities
                         // we are not binding anything here.
-                        if (provider.hasCamera(camSelector)) {
-                            val camera = provider.bindToLifecycle(requireActivity(), camSelector)
-                            QualitySelector
-                                .getSupportedQualities(camera.cameraInfo)
-                                .filter { quality ->
-                                    listOf(Quality.UHD, Quality.FHD, Quality.HD, Quality.SD)
-                                        .contains(quality)
-                                }.also {
-                                    cameraCapabilities.add(CameraCapability(camSelector, it))
-                                }
-                        }
+//                        if (provider.hasCamera(camSelector)) {
+//                            val camera = provider.bindToLifecycle(requireActivity(), camSelector)
+//                            QualitySelector
+//                                .getSupportedQualities(camera.cameraInfo)
+//                                .filter { quality ->
+//                                    listOf(Quality.UHD, Quality.FHD, Quality.HD, Quality.SD)
+//                                        .contains(quality)
+//                                }.also {
+//                                    cameraCapabilities.add(CameraCapability(camSelector, it))
+//                                }
+//                        }
                     } catch (exc: java.lang.Exception) {
                         Log.e(TAG, "Camera Face $camSelector is not supported")
                     }
+                }
+
+                resolutionList = getOutputSizes(getCameraId().toString(), ImageFormat.JPEG).map {
+                    it.width.toString() + "x" + it.height.toString()
+                }
+                aspectRatioList = getSupportedAspectRatios(getCameraId().toString(), ImageFormat.JPEG).map {
+                    it.toString()
                 }
             }
         }

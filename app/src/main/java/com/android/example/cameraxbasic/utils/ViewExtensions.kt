@@ -19,6 +19,7 @@ package com.android.example.cameraxbasic.utils
 import android.os.Build
 import android.view.DisplayCutout
 import android.view.View
+import android.view.ViewTreeObserver
 import android.view.Window
 import android.view.WindowManager
 import android.widget.ImageButton
@@ -105,5 +106,20 @@ private fun hideSystemUI(window: Window) {
                     View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
         @Suppress("DEPRECATION")
         window.decorView.systemUiVisibility = fullscreenFlags
+    }
+}
+
+inline fun View.afterMeasured(crossinline block: () -> Unit) {
+    if (measuredWidth > 0 && measuredHeight > 0) {
+        block()
+    } else {
+        viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
+            override fun onGlobalLayout() {
+                if (measuredWidth > 0 && measuredHeight > 0) {
+                    viewTreeObserver.removeOnGlobalLayoutListener(this)
+                    block()
+                }
+            }
+        })
     }
 }
