@@ -1,6 +1,8 @@
 package com.android.example.cameraxbasic
 import androidx.camera.core.AspectRatio
 import androidx.camera.video.Quality
+import androidx.camera.video.VideoRecordEvent
+
 /**
  * a helper function to retrieve the aspect ratio from a QualitySelector enum.
  */
@@ -52,5 +54,19 @@ fun Quality.getQualityObject(name:String) : Quality {
         Quality.HD.getNameString()  -> Quality.HD
         Quality.SD.getNameString()  -> Quality.SD
         else -> throw IllegalArgumentException("Quality string $name is NOT supported")
+    }
+}
+
+/**
+ * A helper extended function to get the name(string) for the VideoRecordEvent.
+ */
+fun VideoRecordEvent.getNameString() : String {
+    return when (this) {
+        is VideoRecordEvent.Status -> "Status"
+        is VideoRecordEvent.Start -> "Started"
+        is VideoRecordEvent.Finalize-> "Finalized"
+        is VideoRecordEvent.Pause -> "Paused"
+        is VideoRecordEvent.Resume -> "Resumed"
+        else -> throw IllegalArgumentException("Unknown VideoRecordEvent: $this")
     }
 }

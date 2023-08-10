@@ -16,6 +16,7 @@
 
 package com.android.example.cameraxbasic.fragments
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.*
 import android.content.res.Configuration
@@ -43,9 +44,18 @@ import android.view.ViewGroup
 import android.widget.Toast
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.concurrent.futures.await
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
+import androidx.core.content.PermissionChecker
+import androidx.core.util.Consumer
 import androidx.core.view.GestureDetectorCompat
 import androidx.core.view.isVisible
 import androidx.core.view.setPadding
@@ -54,27 +64,34 @@ import androidx.dynamicanimation.animation.DynamicAnimation
 import androidx.dynamicanimation.animation.SpringAnimation
 import androidx.dynamicanimation.animation.SpringForce
 import androidx.fragment.app.Fragment
-import androidx.lifecycle.findViewTreeLifecycleOwner
+import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.whenCreated
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.navigation.Navigation
 import androidx.window.layout.WindowInfoTracker
+import com.android.example.cameraxbasic.CameraCapability
 import com.android.example.cameraxbasic.KEY_EVENT_ACTION
 import com.android.example.cameraxbasic.KEY_EVENT_EXTRA
 import com.android.example.cameraxbasic.PopupWindow
 import com.android.example.cameraxbasic.R
 import com.android.example.cameraxbasic.databinding.CameraUiContainerBinding
 import com.android.example.cameraxbasic.databinding.FragmentCameraBinding
+import com.android.example.cameraxbasic.getAspectRatio
+import com.android.example.cameraxbasic.getAspectRatioString
+import com.android.example.cameraxbasic.getNameString
 import com.android.example.cameraxbasic.utils.ANIMATION_FAST_MILLIS
 import com.android.example.cameraxbasic.utils.ANIMATION_SLOW_MILLIS
 import com.android.example.cameraxbasic.utils.FocusPointDrawable
 import com.android.example.cameraxbasic.utils.MediaStoreUtils
-import com.android.example.cameraxbasic.utils.afterMeasured
 import com.android.example.cameraxbasic.utils.simulateClick
 import com.bumptech.glide.Glide
 import com.bumptech.glide.request.RequestOptions
+import com.google.android.material.tabs.TabLayout
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.*
@@ -106,6 +123,21 @@ class CameraFragment : Fragment() {
 
     private lateinit var mediaStoreUtils: MediaStoreUtils
 
+    private lateinit var videoCapture: VideoCapture<Recorder>
+    private var currentRecording: Recording? = null
+    private lateinit var recordingState: VideoRecordEvent
+    private val captureLiveStatus = MutableLiveData<String>()
+
+    // Camera UI  states and inputs
+    enum class UiState {
+        IDLE,       // Not recording, all UI controls are active.
+        RECORDING,  // Camera is recording, only display Pause/Resume & Stop button.
+        FINALIZED,  // Recording just completes, disable all RECORDING UI controls.
+        RECOVERY    // For future use.
+    }
+
+    private val cameraCapabilities = mutableListOf<CameraCapability>()
+
     private var displayId: Int = -1
     private var lensFacing: Int = CameraSelector.LENS_FACING_BACK
     private var preview: Preview? = null
@@ -116,12 +148,13 @@ class CameraFragment : Fragment() {
     private lateinit var windowInfoTracker: WindowInfoTracker
     private var cameraInfo: CameraInfo? = null
     private var cameraControl: CameraControl? = null
-    //private val cameraCapabilities = mutableListOf<CameraCapability>()
     private var resolutionList = listOf<String>()
     private var aspectRatioList = listOf<String>()
+    private var selectorList = listOf<String>()
     private var cameraIndex = CameraSelector.LENS_FACING_BACK
-    private var qualityIndex = DEFAULT_QUALITY_IDX
+    private var qualityIndex = 0
     private var aspectRatioIndex = 0
+    private var selectorIndex = 0
     private val displayManager by lazy {
         requireContext().getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
     }
@@ -228,6 +261,13 @@ class CameraFragment : Fragment() {
         // Initialize MediaStoreUtils for fetching this app's images
         mediaStoreUtils = MediaStoreUtils(requireContext())
 
+        captureLiveStatus.observe(viewLifecycleOwner) {
+            cameraUiContainerBinding?.captureStatus?.apply {
+                post { text = it }
+            }
+        }
+        captureLiveStatus.value = "Idle"
+
         // Wait for the views to be properly laid out
         fragmentCameraBinding.viewFinder.post {
 
@@ -236,17 +276,34 @@ class CameraFragment : Fragment() {
 
             // Build UI controls
             updateCameraUi()
-
             // Set up the camera and its use cases
             lifecycleScope.launch {
-                setUpCamera()
-                initializeQualitySectionsUI()
+                val listSelectorDeferred = async(Dispatchers.IO) {
+                    getListSolutionAndAspectRatio()
+                }
+                listSelectorDeferred.await().run {
+                    setUpCamera()
+                }
             }
         }
     }
 
+    /**
+     * Retrieve the asked camera's type(lens facing type). In this sample, only 2 types:
+     *   idx is even number:  CameraSelector.LENS_FACING_BACK
+     *          odd number:   CameraSelector.LENS_FACING_FRONT
+     */
+    private fun getCameraSelector(idx: Int): CameraSelector {
+        if (cameraCapabilities.size == 0) {
+            Log.i(TAG, "Error: This device does not have any camera, bailing out")
+            requireActivity().finish()
+        }
+        return (cameraCapabilities[idx % cameraCapabilities.size].camSelector)
+    }
 
-    private fun initializeQualitySectionsUI() {
+    data class CameraCapability(val camSelector: CameraSelector, val qualities: List<Quality>)
+
+    private fun getListSolutionAndAspectRatio() {
 
         resolutionList = getOutputSizes(getCameraId().toString(), ImageFormat.JPEG).map {
             it.width.toString() + "x" + it.height.toString()
@@ -255,8 +312,54 @@ class CameraFragment : Fragment() {
             it.toString()
         }
 
-        cameraUiContainerBinding?.txtAspectRatio?.text = aspectRatioList[aspectRatioIndex]
-        cameraUiContainerBinding?.txtResolution?.text = resolutionList[qualityIndex]
+        lifecycleScope.launch {
+
+            val listSelectorDeferred = async(Dispatchers.IO) {
+                getListSelector()
+            }
+            listSelectorDeferred.await().run {
+                selectorList = cameraCapabilities[cameraIndex].qualities.map {
+                    it.getNameString()
+                }
+            }
+
+            updateUiResolutionAndAspectRatio()
+
+            Log.d("Hien", "getListSolutionAndAspectRatio: ${Thread.currentThread().name}")
+
+        }
+    }
+
+    private suspend fun getListSelector() {
+
+        val provider = ProcessCameraProvider.getInstance(requireContext()).await()
+        withContext(Dispatchers.Main) {
+            provider.unbindAll()
+            for (camSelector in arrayOf(
+                CameraSelector.DEFAULT_BACK_CAMERA,
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            )) {
+                try {
+                    // just get the camera.cameraInfo to query capabilities
+                    // we are not binding anything here.
+                    if (provider.hasCamera(camSelector)) {
+                        val camera = provider.bindToLifecycle(requireActivity(), camSelector)
+                        QualitySelector
+                            .getSupportedQualities(camera.cameraInfo)
+                            .filter { quality ->
+                                listOf(Quality.UHD, Quality.FHD, Quality.HD, Quality.SD)
+                                    .contains(quality)
+                            }.also {
+                                cameraCapabilities.add(CameraCapability(camSelector, it))
+                            }
+                    }
+                } catch (exc: java.lang.Exception) {
+                    Log.e(TAG, "Camera Face $camSelector is not supported")
+                }
+
+            }
+        }
+
     }
 
     /**
@@ -306,13 +409,16 @@ class CameraFragment : Fragment() {
 //        val screenAspectRatio = aspectRatio(metrics.width(), metrics.height())
 //        Log.d(TAG, "Preview aspect ratio: $screenAspectRatio")
 
+        val quality = cameraCapabilities[cameraIndex].qualities[selectorIndex]
+        val qualitySelector = QualitySelector.from(quality)
+
         val rotation = fragmentCameraBinding.viewFinder.display.rotation
         // CameraProvider
         val cameraProvider = cameraProvider
             ?: throw IllegalStateException("Camera initialization failed.")
 
         // CameraSelector
-        val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+        val cameraSelector = getCameraSelector(cameraIndex)
 
 
         val selectedResolutionStr: String = resolutionList[qualityIndex]
@@ -323,22 +429,29 @@ class CameraFragment : Fragment() {
         val size = Size(width, height)
 
         val selectedAspectRatioStr: String = aspectRatioList[aspectRatioIndex]
-        Log.d("Hien", "bindCameraUseCases: $aspectRatioList")
-        val dimensionsRatio = selectedAspectRatioStr.split("/".toRegex()).dropLastWhile { it.isEmpty() }
-            .toTypedArray()
+
+        val dimensionsRatio =
+            selectedAspectRatioStr.split("/".toRegex()).dropLastWhile { it.isEmpty() }
+                .toTypedArray()
         val ratioWidth = dimensionsRatio[0].toInt()
         val ratioHeight = dimensionsRatio[1].toInt()
         val dimensionRationStr = "H,${ratioHeight}:${ratioWidth}"
 
         fragmentCameraBinding.viewFinder.updateLayoutParams<ConstraintLayout.LayoutParams> {
-            dimensionRatio = dimensionRationStr
+//            dimensionRatio = dimensionRationStr
+            val orientation = requireActivity().resources.configuration.orientation
+            dimensionRatio = quality.getAspectRatioString(
+                quality,
+                (orientation == Configuration.ORIENTATION_PORTRAIT)
+            )
         }
-
+        Log.d("Hien", "bindCameraUseCases: ${aspectRatioList[aspectRatioIndex]} - ${cameraCapabilities[cameraIndex].qualities[selectorIndex]} - ${resolutionList[qualityIndex]}")
         // Preview
         preview = Preview.Builder()
             // We request aspect ratio but no resolution
-            .setTargetResolution(size)
+//            .setTargetResolution(size)
 //            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
+            .setTargetAspectRatio(quality.getAspectRatio(quality))
             // Set initial target rotation
             .setTargetRotation(rotation)
             .build().apply {
@@ -355,6 +468,11 @@ class CameraFragment : Fragment() {
             // during the lifecycle of this use case
             .setTargetRotation(rotation)
             .build()
+
+        val recorder = Recorder.Builder()
+            .setQualitySelector(qualitySelector)
+            .build()
+        videoCapture = VideoCapture.withOutput(recorder)
 
         // ImageAnalysis
         imageAnalyzer = ImageAnalysis.Builder()
@@ -375,8 +493,7 @@ class CameraFragment : Fragment() {
                 })
             }
 
-        // Must unbind the use-cases before rebinding them
-        cameraProvider.unbindAll()
+
 
 
         camera?.cameraInfo?.let {
@@ -384,14 +501,13 @@ class CameraFragment : Fragment() {
         }
 
         try {
+            // Must unbind the use-cases before rebinding them
+            cameraProvider.unbindAll()
             // A variable number of use-cases can be passed here -
             // camera provides access to CameraControl & CameraInfo
             camera = cameraProvider.bindToLifecycle(
-                this, cameraSelector, preview, imageCapture, imageAnalyzer
+                this, cameraSelector, preview, imageCapture, videoCapture
             )
-
-            // Attach the viewfinder's surface provider to preview use case
-            preview?.setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
             //camera?.cameraInfo?.let { observeCameraState(it) }
             cameraInfo = camera?.cameraInfo
             cameraControl = camera?.cameraControl
@@ -405,11 +521,12 @@ class CameraFragment : Fragment() {
         cameraInfo.cameraState.removeObservers(viewLifecycleOwner)
     }
 
-    fun getOutputSizes(cameraId: String, format: Int): List<Size> {
+    private fun getOutputSizes(cameraId: String, format: Int): List<Size> {
         val cameraManager = context?.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
 
-        val streamConfigMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val streamConfigMap =
+            characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         return streamConfigMap?.getOutputSizes(format)?.toList() ?: emptyList()
     }
 
@@ -417,7 +534,8 @@ class CameraFragment : Fragment() {
         val cameraManager = context?.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
 
-        val streamConfigMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val streamConfigMap =
+            characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
         val outputSizes = streamConfigMap?.getOutputSizes(format)
 
         val aspectRatios = mutableListOf<Rational>()
@@ -616,70 +734,51 @@ class CameraFragment : Fragment() {
         // Listener for button used to capture photo
         cameraUiContainerBinding?.cameraCaptureButton?.setOnClickListener {
             // Get a stable reference of the modifiable image capture use case
-            imageCapture?.let { imageCapture ->
+            takePhoto()
+        }
 
-                // Create time stamped name and MediaStore entry.
-                val name = SimpleDateFormat(FILENAME, Locale.US)
-                    .format(System.currentTimeMillis())
-                val contentValues = ContentValues().apply {
-                    put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                    put(MediaStore.MediaColumns.MIME_TYPE, PHOTO_TYPE)
-                    if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                        val appName = requireContext().resources.getString(R.string.app_name)
-                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/${appName}")
+        // React to user touching the capture button
+        cameraUiContainerBinding?.cameraRecordButton?.apply {
+            setOnClickListener {
+                if (!::recordingState.isInitialized ||
+                    recordingState is VideoRecordEvent.Finalize
+                ) {
+                    cameraIndex = (cameraIndex + 1) % cameraCapabilities.size
+//                    enableUI(false)  // Our eventListener will turn on the Recording UI.
+                    captureVideo()
+                } else {
+                    when (recordingState) {
+                        is VideoRecordEvent.Start -> {
+                            currentRecording?.pause()
+                            cameraUiContainerBinding?.stopButton?.visibility = View.VISIBLE
+                        }
+
+                        is VideoRecordEvent.Pause -> currentRecording?.resume()
+                        is VideoRecordEvent.Resume -> currentRecording?.pause()
+                        else -> throw IllegalStateException("recordingState in unknown state")
                     }
                 }
-
-                // Create output options object which contains file + metadata
-                val outputOptions = ImageCapture.OutputFileOptions
-                    .Builder(
-                        requireContext().contentResolver,
-                        MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                        contentValues
-                    )
-                    .build()
-
-                // Setup image capture listener which is triggered after photo has been taken
-                imageCapture.takePicture(
-                    outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
-                        override fun onError(exc: ImageCaptureException) {
-                            Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
-                        }
-
-                        override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                            val savedUri = output.savedUri
-                            Log.d(TAG, "Photo capture succeeded: $savedUri")
-
-                            // We can only change the foreground Drawable using API level 23+ API
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                // Update the gallery thumbnail with latest picture taken
-                                setGalleryThumbnail(savedUri.toString())
-                            }
-
-                            // Implicit broadcasts will be ignored for devices running API level >= 24
-                            // so if you only target API level 24+ you can remove this statement
-                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
-                                // Suppress deprecated Camera usage needed for API level 23 and below
-                                @Suppress("DEPRECATION")
-                                requireActivity().sendBroadcast(
-                                    Intent(android.hardware.Camera.ACTION_NEW_PICTURE, savedUri)
-                                )
-                            }
-                        }
-                    })
-
-                // We can only change the foreground Drawable using API level 23+ API
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-
-                    // Display flash animation to indicate that photo was captured
-                    fragmentCameraBinding.root.postDelayed({
-                        fragmentCameraBinding.root.foreground = ColorDrawable(Color.WHITE)
-                        fragmentCameraBinding.root.postDelayed(
-                            { fragmentCameraBinding.root.foreground = null }, ANIMATION_FAST_MILLIS
-                        )
-                    }, ANIMATION_SLOW_MILLIS)
-                }
             }
+        }
+
+        cameraUiContainerBinding?.stopButton?.apply {
+            setOnClickListener {
+                // stopping: hide it after getting a click before we go to viewing fragment
+                cameraUiContainerBinding?.stopButton?.visibility = View.INVISIBLE
+                if (currentRecording == null || recordingState is VideoRecordEvent.Finalize) {
+                    return@setOnClickListener
+                }
+
+                val recording = currentRecording
+                if (recording != null) {
+                    recording.stop()
+                    currentRecording = null
+                }
+                cameraUiContainerBinding?.cameraRecordButton?.setImageResource(R.drawable.ic_start)
+            }
+            // ensure the stop button is initialized disabled & invisible
+            visibility = View.INVISIBLE
+            isEnabled = false
         }
 
         // Setup for button used to switch cameras
@@ -698,8 +797,14 @@ class CameraFragment : Fragment() {
                     CameraSelector.LENS_FACING_FRONT
                 }
                 // Re-bind use cases to update selected camera
-                initializeQualitySectionsUI()
-                bindCameraUseCases()
+                lifecycleScope.launch {
+                    withContext(Dispatchers.IO) {
+                        getListSolutionAndAspectRatio()
+                    }
+                    Log.d("Hien", "switch: ${Thread.currentThread().name}")
+                    updateUiResolutionAndAspectRatio()
+                    bindCameraUseCases()
+                }
             }
         }
 
@@ -742,23 +847,34 @@ class CameraFragment : Fragment() {
             }, aspectRatioList).show()
         }
 
+        cameraUiContainerBinding?.txtQuality?.setOnClickListener { it ->
+            PopupWindow(it, { position ->
+                selectorIndex = position
+                cameraUiContainerBinding?.txtQuality?.text = selectorList[position]
+                viewLifecycleOwner.lifecycleScope.launch {
+                    bindCameraUseCases()
+                }
+            }, selectorList).show()
+        }
+
         val scaleGestureDetector = ScaleGestureDetector(requireActivity(), zoomListener)
 
-        val gestureDetector = GestureDetectorCompat(requireContext(), object : GestureDetector.SimpleOnGestureListener() {
-            override fun onSingleTapUp(e: MotionEvent): Boolean {
-                val meteringPointFactory = fragmentCameraBinding.viewFinder.meteringPointFactory
-                val focusPoint = meteringPointFactory.createPoint(e.x, e.y)
-                try {
-                    val meteringAction = FocusMeteringAction.Builder(focusPoint).build()
-                    camera?.cameraControl?.startFocusAndMetering(meteringAction)
-                    showFocusPoint(fragmentCameraBinding.focusPoint, e.x, e.y)
-                } catch (e: CameraInfoUnavailableException) {
-                    Log.d("ERROR", "cannot access camera", e)
+        val gestureDetector = GestureDetectorCompat(
+            requireContext(),
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onSingleTapUp(e: MotionEvent): Boolean {
+                    val meteringPointFactory = fragmentCameraBinding.viewFinder.meteringPointFactory
+                    val focusPoint = meteringPointFactory.createPoint(e.x, e.y)
+                    try {
+                        val meteringAction = FocusMeteringAction.Builder(focusPoint).build()
+                        camera?.cameraControl?.startFocusAndMetering(meteringAction)
+                        showFocusPoint(fragmentCameraBinding.focusPoint, e.x, e.y)
+                    } catch (e: CameraInfoUnavailableException) {
+                        Log.d("ERROR", "cannot access camera", e)
+                    }
+                    return true
                 }
-                return true
-            }
-        })
-
+            })
 
         fragmentCameraBinding.viewFinder.setOnTouchListener { v, event ->
             v.performClick()
@@ -770,6 +886,262 @@ class CameraFragment : Fragment() {
             didConsume
             return@setOnTouchListener true
         }
+
+        cameraUiContainerBinding?.tabLayout?.addOnTabSelectedListener(object :
+            TabLayout.OnTabSelectedListener {
+            override fun onTabReselected(tab: TabLayout.Tab?) {}
+
+            override fun onTabUnselected(tab: TabLayout.Tab?) {}
+
+            override fun onTabSelected(tab: TabLayout.Tab?) {
+                when (tab?.position) {
+                    PHOTO -> {
+                        cameraUiContainerBinding?.cameraCaptureButton?.visibility = View.VISIBLE
+                        cameraUiContainerBinding?.cameraSwitchButton?.visibility = View.VISIBLE
+                        cameraUiContainerBinding?.photoViewButton?.visibility = View.VISIBLE
+                        cameraUiContainerBinding?.cameraRecordButton?.visibility = View.GONE
+                    }
+
+                    VIDEO -> {
+                        cameraUiContainerBinding?.cameraCaptureButton?.visibility = View.GONE
+                        cameraUiContainerBinding?.photoViewButton?.visibility = View.GONE
+                        cameraUiContainerBinding?.cameraRecordButton?.visibility = View.VISIBLE
+
+                    }
+                }
+            }
+
+        })
+    }
+
+    private fun captureVideo() {
+        // create MediaStoreOutputOptions for our recorder: resulting our recording!
+        val name = "CameraX-recording-" +
+                SimpleDateFormat(FILENAME, Locale.US)
+                    .format(System.currentTimeMillis()) + ".mp4"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, name)
+        }
+        val mediaStoreOutput = MediaStoreOutputOptions.Builder(
+            requireActivity().contentResolver,
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        )
+            .setContentValues(contentValues)
+            .build()
+
+        // configure Recorder and Start recording to the mediaStoreOutput.
+        currentRecording = videoCapture.output
+            .prepareRecording(requireActivity(), mediaStoreOutput)
+            .apply {
+                if (PermissionChecker.checkSelfPermission(
+                        requireActivity(),
+                        Manifest.permission.RECORD_AUDIO
+                    ) ==
+                    PermissionChecker.PERMISSION_GRANTED
+                ) {
+                    withAudioEnabled()
+                }
+            }
+            .start(ContextCompat.getMainExecutor(requireActivity()), captureListener)
+
+        Log.i(TAG, "Recording started")
+    }
+
+    /**
+     * CaptureEvent listener.
+     */
+    private val captureListener = Consumer<VideoRecordEvent> { event ->
+        // cache the recording state
+        if (event !is VideoRecordEvent.Status)
+            recordingState = event
+
+        updateUI(event)
+
+//        if (event is VideoRecordEvent.Finalize) {
+//            // display the captured video
+//            lifecycleScope.launch {
+//                navController.navigate(
+//                    CaptureFragmentDirections.actionCaptureToVideoViewer(
+//                        event.outputResults.outputUri
+//                    )
+//                )
+//            }
+//        }
+    }
+
+    /**
+     * UpdateUI according to CameraX VideoRecordEvent type:
+     *   - user starts capture.
+     *   - this app disables all UI selections.
+     *   - this app enables capture run-time UI (pause/resume/stop).
+     *   - user controls recording with run-time UI, eventually tap "stop" to end.
+     *   - this app informs CameraX recording to stop with recording.stop() (or recording.close()).
+     *   - CameraX notify this app that the recording is indeed stopped, with the Finalize event.
+     *   - this app starts VideoViewer fragment to view the captured result.
+     */
+    private fun updateUI(event: VideoRecordEvent) {
+        val state = if (event is VideoRecordEvent.Status) recordingState.getNameString()
+        else event.getNameString()
+
+        when (event) {
+            is VideoRecordEvent.Status -> {
+                // placeholder: we update the UI with new status after this when() block,
+                // nothing needs to do here.
+            }
+
+            is VideoRecordEvent.Start -> {
+                showUI(UiState.RECORDING, event.getNameString())
+            }
+
+            is VideoRecordEvent.Finalize -> {
+                showUI(UiState.FINALIZED, event.getNameString())
+            }
+
+            is VideoRecordEvent.Pause -> {
+                cameraUiContainerBinding?.cameraRecordButton?.setImageResource(R.drawable.ic_resume)
+            }
+
+            is VideoRecordEvent.Resume -> {
+                cameraUiContainerBinding?.cameraRecordButton?.setImageResource(R.drawable.ic_pause)
+            }
+        }
+
+        val stats = event.recordingStats
+        val size = stats.numBytesRecorded / 1000
+        val time = java.util.concurrent.TimeUnit.NANOSECONDS.toSeconds(stats.recordedDurationNanos)
+        var text = "${state}: recorded ${size}KB, in ${time}second"
+        if (event is VideoRecordEvent.Finalize)
+            text = "${text}\nFile saved to: ${event.outputResults.outputUri}"
+
+        captureLiveStatus.value = text
+        Log.i(TAG, "recording event: $text")
+    }
+
+    /**
+     * initialize UI for recording:
+     *  - at recording: hide audio, qualitySelection,change camera UI; enable stop button
+     *  - otherwise: show all except the stop button
+     */
+    private fun showUI(state: UiState, status: String = "idle") {
+        cameraUiContainerBinding.let {
+            when (state) {
+                UiState.IDLE -> {
+                    it?.cameraRecordButton?.setImageResource(R.drawable.ic_start)
+                    it?.stopButton?.visibility = View.INVISIBLE
+
+                    it?.cameraSwitchButton?.visibility = View.VISIBLE
+                    it?.txtResolution?.visibility = View.VISIBLE
+                    it?.txtAspectRatio?.visibility = View.VISIBLE
+                    it?.txtQuality?.visibility = View.VISIBLE
+                }
+
+                UiState.RECORDING -> {
+                    it?.cameraSwitchButton?.visibility = View.INVISIBLE
+                    it?.txtResolution?.visibility = View.INVISIBLE
+                    it?.txtAspectRatio?.visibility = View.INVISIBLE
+                    it?.txtQuality?.visibility = View.INVISIBLE
+
+                    it?.cameraRecordButton?.setImageResource(R.drawable.ic_pause)
+                    it?.cameraRecordButton?.isEnabled = true
+                    it?.stopButton?.visibility = View.VISIBLE
+                    it?.stopButton?.isEnabled = true
+                    cameraUiContainerBinding?.tabLayout?.visibility = View.GONE
+                }
+
+                UiState.FINALIZED -> {
+                    it?.cameraRecordButton?.setImageResource(R.drawable.ic_start)
+                    it?.stopButton?.visibility = View.INVISIBLE
+                    cameraUiContainerBinding?.captureStatus?.visibility = View.GONE
+                    cameraUiContainerBinding?.txtResolution?.visibility = View.VISIBLE
+                    cameraUiContainerBinding?.txtAspectRatio?.visibility = View.VISIBLE
+                    cameraUiContainerBinding?.txtQuality?.visibility = View.VISIBLE
+                    cameraUiContainerBinding?.tabLayout?.visibility = View.VISIBLE
+                }
+
+                else -> {
+                    val errorMsg = "Error: showUI($state) is not supported"
+                    Log.e(TAG, errorMsg)
+                    return
+                }
+            }
+            it?.captureStatus?.text = status
+        }
+    }
+
+    private fun takePhoto() {
+        imageCapture?.let { imageCapture ->
+
+            // Create time stamped name and MediaStore entry.
+            val name = SimpleDateFormat(FILENAME, Locale.US)
+                .format(System.currentTimeMillis())
+            val contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                put(MediaStore.MediaColumns.MIME_TYPE, PHOTO_TYPE)
+                if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
+                    val appName = requireContext().resources.getString(R.string.app_name)
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/${appName}")
+                }
+            }
+
+            // Create output options object which contains file + metadata
+            val outputOptions = ImageCapture.OutputFileOptions
+                .Builder(
+                    requireContext().contentResolver,
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    contentValues
+                )
+                .build()
+
+            // Setup image capture listener which is triggered after photo has been taken
+            imageCapture.takePicture(
+                outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+                    override fun onError(exc: ImageCaptureException) {
+                        Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
+                    }
+
+                    override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                        val savedUri = output.savedUri
+                        Log.d(TAG, "Photo capture succeeded: $savedUri")
+
+                        // We can only change the foreground Drawable using API level 23+ API
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                            // Update the gallery thumbnail with latest picture taken
+                            setGalleryThumbnail(savedUri.toString())
+                        }
+
+                        // Implicit broadcasts will be ignored for devices running API level >= 24
+                        // so if you only target API level 24+ you can remove this statement
+                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+                            // Suppress deprecated Camera usage needed for API level 23 and below
+                            @Suppress("DEPRECATION")
+                            requireActivity().sendBroadcast(
+                                Intent(android.hardware.Camera.ACTION_NEW_PICTURE, savedUri)
+                            )
+                        }
+                    }
+                })
+
+            // We can only change the foreground Drawable using API level 23+ API
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+
+                // Display flash animation to indicate that photo was captured
+                fragmentCameraBinding.root.postDelayed({
+                    fragmentCameraBinding.root.foreground = ColorDrawable(Color.WHITE)
+                    fragmentCameraBinding.root.postDelayed(
+                        { fragmentCameraBinding.root.foreground = null }, ANIMATION_FAST_MILLIS
+                    )
+                }, ANIMATION_SLOW_MILLIS)
+            }
+        }
+    }
+
+    private fun updateUiResolutionAndAspectRatio() {
+        aspectRatioIndex = 0
+        qualityIndex = 0
+        selectorIndex = 0
+        cameraUiContainerBinding?.txtAspectRatio?.text = aspectRatioList[aspectRatioIndex]
+        cameraUiContainerBinding?.txtResolution?.text = resolutionList[qualityIndex]
+        cameraUiContainerBinding?.txtQuality?.text = selectorList[selectorIndex]
     }
 
     private fun showFocusPoint(view: View?, x: Float, y: Float) {
@@ -863,14 +1235,6 @@ class CameraFragment : Fragment() {
             return true
         }
     }
-
-//    private fun getCameraSelector(idx: Int): CameraSelector {
-//        if (cameraCapabilities.size == 0) {
-//            Log.i(TAG, "Error: This device does not have any camera, bailing out")
-//            requireActivity().finish()
-//        }
-//        return (cameraCapabilities[idx % cameraCapabilities.size].camSelector)
-//    }
 
     /** Returns true if the device has an available back camera. False otherwise */
     private fun hasBackCamera(): Boolean {
@@ -974,44 +1338,17 @@ class CameraFragment : Fragment() {
         private const val SPRING_STIFFNESS_ALPHA_OUT = 100f
         private const val SPRING_STIFFNESS = 800f
         private const val SPRING_DAMPING_RATIO = 0.35f
+        private const val PHOTO = 0
+        private const val VIDEO = 1
     }
 
     init {
         lifecycleScope.launch {
             whenCreated {
-                val provider = ProcessCameraProvider.getInstance(requireContext()).await()
-
-                provider.unbindAll()
-                for (camSelector in arrayOf(
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    CameraSelector.DEFAULT_FRONT_CAMERA
-                )) {
-                    try {
-                        // just get the camera.cameraInfo to query capabilities
-                        // we are not binding anything here.
-//                        if (provider.hasCamera(camSelector)) {
-//                            val camera = provider.bindToLifecycle(requireActivity(), camSelector)
-//                            QualitySelector
-//                                .getSupportedQualities(camera.cameraInfo)
-//                                .filter { quality ->
-//                                    listOf(Quality.UHD, Quality.FHD, Quality.HD, Quality.SD)
-//                                        .contains(quality)
-//                                }.also {
-//                                    cameraCapabilities.add(CameraCapability(camSelector, it))
-//                                }
-//                        }
-                    } catch (exc: java.lang.Exception) {
-                        Log.e(TAG, "Camera Face $camSelector is not supported")
-                    }
-                }
-
-                resolutionList = getOutputSizes(getCameraId().toString(), ImageFormat.JPEG).map {
-                    it.width.toString() + "x" + it.height.toString()
-                }
-                aspectRatioList = getSupportedAspectRatios(getCameraId().toString(), ImageFormat.JPEG).map {
-                    it.toString()
-                }
+                getListSelector()
             }
+
         }
+
     }
 }
