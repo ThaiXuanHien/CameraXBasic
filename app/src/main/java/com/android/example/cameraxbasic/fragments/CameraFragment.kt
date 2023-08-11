@@ -151,10 +151,10 @@ class CameraFragment : Fragment() {
     private var resolutionList = listOf<String>()
     private var aspectRatioList = listOf<String>()
     private var selectorList = listOf<String>()
-    private var cameraIndex = CameraSelector.LENS_FACING_BACK
     private var qualityIndex = 0
     private var aspectRatioIndex = 0
     private var selectorIndex = 0
+    private var tabIndex = 0
     private val displayManager by lazy {
         requireContext().getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
     }
@@ -318,7 +318,7 @@ class CameraFragment : Fragment() {
                 getListSelector()
             }
             listSelectorDeferred.await().run {
-                selectorList = cameraCapabilities[cameraIndex].qualities.map {
+                selectorList = cameraCapabilities[lensFacing].qualities.map {
                     it.getNameString()
                 }
             }
@@ -382,7 +382,7 @@ class CameraFragment : Fragment() {
 
     /** Initialize CameraX, and prepare to bind the camera use cases  */
     private suspend fun setUpCamera() {
-        cameraProvider = ProcessCameraProvider.getInstance(requireContext()).await()
+        cameraProvider = ProcessCameraProvider.getInstance(requireActivity()).await()
 
         // Select lensFacing depending on the available cameras
         lensFacing = when {
@@ -400,7 +400,112 @@ class CameraFragment : Fragment() {
 
     /** Declare and bind preview, capture and analysis use cases */
     private fun bindCameraUseCases() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(requireActivity())
+        cameraProviderFuture.addListener({
+            val quality = cameraCapabilities[lensFacing].qualities[selectorIndex]
+            val qualitySelector = QualitySelector.from(quality)
 
+            val rotation = fragmentCameraBinding.viewFinder.display.rotation
+            // CameraProvider
+            val cameraProvider = cameraProvider
+                ?: throw IllegalStateException("Camera initialization failed.")
+
+            // CameraSelector
+            val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+
+
+            val selectedResolutionStr: String = resolutionList[qualityIndex]
+            val dimensions = selectedResolutionStr.split("x".toRegex()).dropLastWhile { it.isEmpty() }
+                .toTypedArray()
+            val width = dimensions[0].toInt()
+            val height = dimensions[1].toInt()
+            val size = Size(width, height)
+
+            val selectedAspectRatioStr: String = aspectRatioList[aspectRatioIndex]
+
+            val dimensionsRatio =
+                selectedAspectRatioStr.split("/".toRegex()).dropLastWhile { it.isEmpty() }
+                    .toTypedArray()
+            val ratioWidth = dimensionsRatio[0].toInt()
+            val ratioHeight = dimensionsRatio[1].toInt()
+            val dimensionRationStr = "V,${ratioHeight}:${ratioWidth}"
+
+            fragmentCameraBinding.viewFinder.updateLayoutParams<ConstraintLayout.LayoutParams> {
+//            dimensionRatio = dimensionRationStr
+                val orientation = requireActivity().resources.configuration.orientation
+                dimensionRatio = quality.getAspectRatioString(
+                    quality,
+                    (orientation == Configuration.ORIENTATION_PORTRAIT)
+                )
+            }
+            Log.d("Hien", "bindCameraUseCases: quality: $quality tabIndex: $tabIndex - lensFacing: $lensFacing - ${aspectRatioList[aspectRatioIndex]} - ${cameraCapabilities[lensFacing].qualities[selectorIndex]} - ${resolutionList[qualityIndex]}")
+            // Preview
+            preview = Preview.Builder()
+                // We request aspect ratio but no resolution
+//            .setTargetResolution(size)
+//            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
+                .setTargetAspectRatio(quality.getAspectRatio(quality))
+                // Set initial target rotation
+                .setTargetRotation(rotation)
+                .build().apply {
+                    setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
+                }
+            // ImageCapture
+            imageCapture = ImageCapture.Builder()
+                .setTargetResolution(size)
+//            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                // We request aspect ratio but no resolution to match preview config, but letting
+                // CameraX optimize for whatever specific resolution best fits our use cases
+                // Set initial target rotation, we will have to call this again if rotation changes
+                // during the lifecycle of this use case
+                .setTargetRotation(rotation)
+                .build()
+
+            val recorder = Recorder.Builder()
+                .setQualitySelector(qualitySelector)
+                .build()
+            videoCapture = VideoCapture.withOutput(recorder)
+
+            // ImageAnalysis
+            imageAnalyzer = ImageAnalysis.Builder()
+                // We request aspect ratio but no resolution
+                .setTargetResolution(size)
+//            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
+                // Set initial target rotation, we will have to call this again if rotation changes
+                // during the lifecycle of this use case
+                .setTargetRotation(rotation)
+                .build()
+                // The analyzer can then be assigned to the instance
+                .also {
+                    it.setAnalyzer(cameraExecutor, LuminosityAnalyzer { luma ->
+                        // Values returned from our analyzer are passed to the attached listener
+                        // We log image analysis results here - you should do something useful
+                        // instead!
+                        Log.d(TAG, "Average luminosity: $luma")
+                    })
+                }
+
+            camera?.cameraInfo?.let {
+                removeCameraStateObservers(it)
+            }
+
+            try {
+                // Must unbind the use-cases before rebinding them
+                cameraProvider.unbindAll()
+                // A variable number of use-cases can be passed here -
+                // camera provides access to CameraControl & CameraInfo
+                camera = cameraProvider.bindToLifecycle(
+                    this, cameraSelector, preview, if (tabIndex == PHOTO) imageCapture else videoCapture
+                )
+                //camera?.cameraInfo?.let { observeCameraState(it) }
+                cameraInfo = camera?.cameraInfo
+                cameraControl = camera?.cameraControl
+                setTorchStateObserver()
+            } catch (exc: Exception) {
+                Log.e(TAG, "Use case binding failed", exc)
+            }
+        }, ContextCompat.getMainExecutor(requireActivity()))
         // Get screen metrics used to setup camera for full screen resolution
 //        val metrics = WindowMetricsCalculator.getOrCreate()
 //            .computeCurrentWindowMetrics(requireActivity()).bounds
@@ -409,112 +514,7 @@ class CameraFragment : Fragment() {
 //        val screenAspectRatio = aspectRatio(metrics.width(), metrics.height())
 //        Log.d(TAG, "Preview aspect ratio: $screenAspectRatio")
 
-        val quality = cameraCapabilities[cameraIndex].qualities[selectorIndex]
-        val qualitySelector = QualitySelector.from(quality)
 
-        val rotation = fragmentCameraBinding.viewFinder.display.rotation
-        // CameraProvider
-        val cameraProvider = cameraProvider
-            ?: throw IllegalStateException("Camera initialization failed.")
-
-        // CameraSelector
-        val cameraSelector = getCameraSelector(cameraIndex)
-
-
-        val selectedResolutionStr: String = resolutionList[qualityIndex]
-        val dimensions = selectedResolutionStr.split("x".toRegex()).dropLastWhile { it.isEmpty() }
-            .toTypedArray()
-        val width = dimensions[0].toInt()
-        val height = dimensions[1].toInt()
-        val size = Size(width, height)
-
-        val selectedAspectRatioStr: String = aspectRatioList[aspectRatioIndex]
-
-        val dimensionsRatio =
-            selectedAspectRatioStr.split("/".toRegex()).dropLastWhile { it.isEmpty() }
-                .toTypedArray()
-        val ratioWidth = dimensionsRatio[0].toInt()
-        val ratioHeight = dimensionsRatio[1].toInt()
-        val dimensionRationStr = "H,${ratioHeight}:${ratioWidth}"
-
-        fragmentCameraBinding.viewFinder.updateLayoutParams<ConstraintLayout.LayoutParams> {
-//            dimensionRatio = dimensionRationStr
-            val orientation = requireActivity().resources.configuration.orientation
-            dimensionRatio = quality.getAspectRatioString(
-                quality,
-                (orientation == Configuration.ORIENTATION_PORTRAIT)
-            )
-        }
-        Log.d("Hien", "bindCameraUseCases: ${aspectRatioList[aspectRatioIndex]} - ${cameraCapabilities[cameraIndex].qualities[selectorIndex]} - ${resolutionList[qualityIndex]}")
-        // Preview
-        preview = Preview.Builder()
-            // We request aspect ratio but no resolution
-//            .setTargetResolution(size)
-//            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
-            .setTargetAspectRatio(quality.getAspectRatio(quality))
-            // Set initial target rotation
-            .setTargetRotation(rotation)
-            .build().apply {
-                setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
-            }
-        // ImageCapture
-        imageCapture = ImageCapture.Builder()
-            .setTargetResolution(size)
-//            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
-            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-            // We request aspect ratio but no resolution to match preview config, but letting
-            // CameraX optimize for whatever specific resolution best fits our use cases
-            // Set initial target rotation, we will have to call this again if rotation changes
-            // during the lifecycle of this use case
-            .setTargetRotation(rotation)
-            .build()
-
-        val recorder = Recorder.Builder()
-            .setQualitySelector(qualitySelector)
-            .build()
-        videoCapture = VideoCapture.withOutput(recorder)
-
-        // ImageAnalysis
-        imageAnalyzer = ImageAnalysis.Builder()
-            // We request aspect ratio but no resolution
-            .setTargetResolution(size)
-//            .setTargetAspectRatio(aspectRatio(ratioWidth, ratioHeight))
-            // Set initial target rotation, we will have to call this again if rotation changes
-            // during the lifecycle of this use case
-            .setTargetRotation(rotation)
-            .build()
-            // The analyzer can then be assigned to the instance
-            .also {
-                it.setAnalyzer(cameraExecutor, LuminosityAnalyzer { luma ->
-                    // Values returned from our analyzer are passed to the attached listener
-                    // We log image analysis results here - you should do something useful
-                    // instead!
-                    Log.d(TAG, "Average luminosity: $luma")
-                })
-            }
-
-
-
-
-        camera?.cameraInfo?.let {
-            removeCameraStateObservers(it)
-        }
-
-        try {
-            // Must unbind the use-cases before rebinding them
-            cameraProvider.unbindAll()
-            // A variable number of use-cases can be passed here -
-            // camera provides access to CameraControl & CameraInfo
-            camera = cameraProvider.bindToLifecycle(
-                this, cameraSelector, preview, imageCapture, videoCapture
-            )
-            //camera?.cameraInfo?.let { observeCameraState(it) }
-            cameraInfo = camera?.cameraInfo
-            cameraControl = camera?.cameraControl
-            setTorchStateObserver()
-        } catch (exc: Exception) {
-            Log.e(TAG, "Use case binding failed", exc)
-        }
     }
 
     private fun removeCameraStateObservers(cameraInfo: CameraInfo) {
@@ -558,7 +558,7 @@ class CameraFragment : Fragment() {
                 val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
                 val facing = cameraCharacteristics.get(CameraCharacteristics.LENS_FACING)
 
-                if (facing == cameraIndex) {
+                if (facing == lensFacing) {
                     return cameraId
                 }
             }
@@ -743,7 +743,6 @@ class CameraFragment : Fragment() {
                 if (!::recordingState.isInitialized ||
                     recordingState is VideoRecordEvent.Finalize
                 ) {
-                    cameraIndex = (cameraIndex + 1) % cameraCapabilities.size
 //                    enableUI(false)  // Our eventListener will turn on the Recording UI.
                     captureVideo()
                 } else {
@@ -790,10 +789,10 @@ class CameraFragment : Fragment() {
             // Listener for button used to switch cameras. Only called if the button is enabled
             it.setOnClickListener {
                 lensFacing = if (CameraSelector.LENS_FACING_FRONT == lensFacing) {
-                    cameraIndex = CameraSelector.LENS_FACING_BACK
+                    lensFacing = CameraSelector.LENS_FACING_BACK
                     CameraSelector.LENS_FACING_BACK
                 } else {
-                    cameraIndex = CameraSelector.LENS_FACING_FRONT
+                    lensFacing = CameraSelector.LENS_FACING_FRONT
                     CameraSelector.LENS_FACING_FRONT
                 }
                 // Re-bind use cases to update selected camera
@@ -896,17 +895,20 @@ class CameraFragment : Fragment() {
             override fun onTabSelected(tab: TabLayout.Tab?) {
                 when (tab?.position) {
                     PHOTO -> {
+                        tabIndex = PHOTO
                         cameraUiContainerBinding?.cameraCaptureButton?.visibility = View.VISIBLE
                         cameraUiContainerBinding?.cameraSwitchButton?.visibility = View.VISIBLE
                         cameraUiContainerBinding?.photoViewButton?.visibility = View.VISIBLE
                         cameraUiContainerBinding?.cameraRecordButton?.visibility = View.GONE
+                        bindCameraUseCases()
                     }
 
                     VIDEO -> {
+                        tabIndex = VIDEO
                         cameraUiContainerBinding?.cameraCaptureButton?.visibility = View.GONE
                         cameraUiContainerBinding?.photoViewButton?.visibility = View.GONE
                         cameraUiContainerBinding?.cameraRecordButton?.visibility = View.VISIBLE
-
+                        bindCameraUseCases()
                     }
                 }
             }
@@ -1036,6 +1038,7 @@ class CameraFragment : Fragment() {
                 }
 
                 UiState.RECORDING -> {
+                    cameraUiContainerBinding?.captureStatus?.visibility = View.VISIBLE
                     it?.cameraSwitchButton?.visibility = View.INVISIBLE
                     it?.txtResolution?.visibility = View.INVISIBLE
                     it?.txtAspectRatio?.visibility = View.INVISIBLE
@@ -1056,6 +1059,7 @@ class CameraFragment : Fragment() {
                     cameraUiContainerBinding?.txtAspectRatio?.visibility = View.VISIBLE
                     cameraUiContainerBinding?.txtQuality?.visibility = View.VISIBLE
                     cameraUiContainerBinding?.tabLayout?.visibility = View.VISIBLE
+                    cameraUiContainerBinding?.cameraSwitchButton?.visibility = View.VISIBLE
                 }
 
                 else -> {
@@ -1094,7 +1098,7 @@ class CameraFragment : Fragment() {
 
             // Setup image capture listener which is triggered after photo has been taken
             imageCapture.takePicture(
-                outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+                outputOptions, ContextCompat.getMainExecutor(requireActivity()), object : ImageCapture.OnImageSavedCallback {
                     override fun onError(exc: ImageCaptureException) {
                         Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
                     }
